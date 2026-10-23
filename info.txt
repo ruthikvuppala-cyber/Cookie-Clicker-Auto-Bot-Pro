@@ -1,0 +1,12 @@
+{
+  "Name": "Cookie Auto Bot Pro",
+  "ID": "autoBaker",
+  "Author": "ruthikvuppala-cyber",
+  "Description": "Frozen Cookies style automation and info panel: auto-buy, auto-click, golden cookies, wrinklers, Godzamok, spells, auto-ascend and more.",
+  "ModVersion": "1.0",
+  "GameVersion": "2.052",
+  "Date": "2026-10-22",
+  "Dependencies": [],
+  "LanguagePacks": [],
+  "Disabled": 0
+}
