@@ -1,1 +1,0 @@
-# Cookie-Clicker-Auto-Bot-Pro
