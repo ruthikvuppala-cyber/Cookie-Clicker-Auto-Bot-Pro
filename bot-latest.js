@@ -11,7 +11,7 @@
  *   Auto-ascend with reset routine (pop wrinklers, sell buildings, Chocolate egg) + bulk-buy after reincarnation
  *   Save backups: timed export to browser storage and/or a downloadable file, plus a backup before every auto-ascend
  *   Smart auto-ascend (ascends when the chip rate stops beating the run's average), season cycling, custom never-buy list
- *   Background-tab safe timers (Web Worker), hotkeys (P pause, S save, R reset settings, E export),
+ *   Background-tab safe timers (Web Worker), hotkeys (P pause, S save, R wipe save, E export),
  *   copy / paste of bot settings
  * INFO
  *   Next purchase + efficiency %, bank targets, GC / Frenzy timers, Heavenly Chip projections,
@@ -19,6 +19,14 @@
  *   number formatting, press "e" to open the save export string.
  *   Session log (what the bot bought, popped, cast, harvested) with download, optional sound / notification
  *   for rare golden-cookie buffs.
+ *
+ * PERFORMANCE (2.3)
+ *   - buy scan: one economy recalculation per candidate instead of two, cached for 1s (best item is still
+ *     bought instantly from the cache), so the scan costs ~8x less CPU
+ *   - info panel / log / graph: only redrawn when their text actually changes, at 1 Hz instead of 2 Hz
+ *   - clicking: burst capped per frame + adaptive easing when clicks start eating the frame budget
+ *   - ascension countdown: "cookies until next chip" cached for 5s (it is a big search)
+ *   - panel: heaviest title glow removed (it repainted on every panel update)
  *
  * Load: paste into the browser console on the game page, or use it as a Steam mod (main.js + info.txt).
  */
@@ -28,7 +36,7 @@
   var MOD_ID = 'autoBakerPlain';
   var TIP = 'Welcome! The bot is on: it clicks, buys and grabs golden cookies for you. Use the big switch to pause it, pick a preset, or open a section to fine-tune. Hover any setting for help.';
   if (typeof Game === 'undefined' || !Game.ready) { console.log('[' + NAME + '] Game not ready yet.'); return; }
-  var VERSION = '2.2';
+  var VERSION = '2.3';
   var LABEL = 'v' + VERSION;
   if (window.AutoBakerLoaded) {
     var running = (typeof window.AutoBakerLoaded === 'string') ? (/^\d/.test(window.AutoBakerLoaded) ? 'v' + window.AutoBakerLoaded : window.AutoBakerLoaded) : 'an older version';
@@ -91,11 +99,13 @@
   var seenBuffs = {};
   var bk = { last: Date.now() };
   var LS_IDX = 'abBackupIndex';
+  var LS_SETTINGS = 'abBotSettings';   // bot settings, mirrored here every time the game saves
   var chipHist = [];        // {t, p}: pending heavenly chips over the last ~10 minutes (smart ascend)
   var seasonRun = { mode: 'off', idx: 0, since: 0, done: false };
   var hb = { worker: null, timer: null, mode: '', lastLogic: 0, lastBackup: 0 };
   var customBL = { src: null, map: {} };
   var stockPaid = {};       // good id -> average price per share the bot paid (cost basis)
+  var evalCache = { t: 0 }; // when the buy list was last fully evaluated (perf: the scan is expensive)
 
   /* ------------------------------------------------------------------ helpers */
   function now() { return Date.now(); }
@@ -167,10 +177,13 @@
   }
 
   /* ------------------------------------------------------------------ purchase evaluation */
-  function gainOf(apply, undo) {
-    var base = rawCps(), g = base;
+  // One economy recalculation per candidate (the undo does not recalculate: CalculateGains is a full
+  // recompute, so the next candidate's pass already rebuilds a clean state). candidates() restores it
+  // once at the end. This is the single biggest CPU saving in the bot.
+  function gainOf(base, apply, undo) {
+    var g = base;
     try { apply(); Game.CalculateGains(); g = rawCps(); }
-    finally { undo(); Game.CalculateGains(); }
+    finally { undo(); }
     return g - base;
   }
   function wizFull() {
@@ -195,18 +208,20 @@
   }
   function candidates() {
     var list = [];
+    var base = rawCps();
     Game.ObjectsById.forEach(function (o) {
       if (o.locked) return;
       var price = o.getPrice();
-      var g = gainOf(function () { o.amount++; }, function () { o.amount--; });
+      var g = gainOf(base, function () { o.amount++; }, function () { o.amount--; });
       list.push({ kind: 'building', ref: o, name: o.name, price: price, gain: g });
     });
     Game.UpgradesInStore.forEach(function (u) {
       if (u.pool === 'toggle' || u.pool === 'debug') return;
       var price = u.getPrice();
-      var g = gainOf(function () { u.bought = 1; }, function () { u.bought = 0; });
+      var g = gainOf(base, function () { u.bought = 1; }, function () { u.bought = 0; });
       list.push({ kind: 'upgrade', ref: u, name: u.name, price: price, gain: g });
     });
+    Game.CalculateGains();                       // one restore for the whole scan
     var cps = Math.max(Game.cookiesPs, 0.1);
     list.forEach(function (c) {
       c.eff = c.gain > 0 ? c.price / c.gain : Infinity;                      // payback seconds
@@ -266,10 +281,16 @@
     if (Game.buyMode !== 1 || resetting()) return;
     // While Godzamok has sold buildings for a boost, buying would just rebuy them straight away and undo the trick.
     if (godz.active) { status = 'Godzamok: holding purchases until the boost ends'; return; }
-    var list = candidates();
-    info.list = list;
-    var best = pickBest(list);
-    info.best = best;
+    // The scan touches every building and upgrade, so it runs once a second; the cached best item is
+    // still bought the moment you can afford it, so buying stays instant.
+    var t = now();
+    if (!info.best || t - evalCache.t >= 1000) {
+      evalCache.t = t;
+      var list = candidates();
+      info.list = list;
+      info.best = pickBest(list);
+    }
+    var best = info.best;
     if (!best) { status = 'Nothing worth buying right now'; return; }
     var reserve = bankTarget();
     var need = best.price + reserve - Game.cookies;
@@ -280,6 +301,7 @@
       status = 'Bought ' + best.name;
       sess.bought++;
       logEvent('Bought ' + best.name + (bulk > 1 ? ' x' + bulk : '') + ' for ' + fmt(best.price));
+      info.best = null; evalCache.t = 0;             // prices and the store changed: rescan next tick
     } else {
       if (S.wrinklerBuyPop && wrinklerValue(false) >= need) popWrinklers(false);   // never spends shinies while "keep shiny" is on
       status = 'Saving up for ' + best.name + ' (ready in ' + fmtTime(info.wait) + ')' + (reserve > 0 ? ', keeping ' + fmt(reserve) + ' spare' : '');
@@ -287,7 +309,8 @@
   }
 
   /* ------------------------------------------------------------------ clicking */
-  var clickAcc = 0, lastTick = now();
+  var clickAcc = 0, lastTick = now(), clickCost = 0;
+  function perfNow() { return (window.performance && window.performance.now) ? window.performance.now() : now(); }
   function clickTick() {
     var t = now(), dt = (t - lastTick) / 1000; lastTick = t;
     if (!botActive() || !S.click || Game.OnAscend || Game.AscendTimer > 0) return;
@@ -295,10 +318,17 @@
     if (S.clickFrenzy && (hasBuff('Click frenzy') || hasBuff('Dragonflight') || hasBuff('Cursed finger'))) {
       rate = Math.max(rate, S.clickFrenzyRate);
     }
+    // Adaptive easing: if clicking is eating the frame, slow the click rate instead of stuttering the game.
+    if (clickCost > 2.5) rate = Math.max(10, rate * 2.5 / clickCost);
     clickAcc += Math.min(dt, 0.25) * rate;
-    var n = 0;
-    while (clickAcc >= 1 && n < 10) { Game.ClickCookie(); clickAcc--; n++; }
-    if (clickAcc > 10) clickAcc = 10;
+    if (clickAcc > 10) clickAcc = 10;                 // never dump a huge burst into a single frame
+    if (clickAcc < 1) return;
+    var n = Math.min(Math.floor(clickAcc), 8);
+    clickAcc -= n;
+    var t0 = perfNow();
+    for (var i = 0; i < n; i++) Game.ClickCookie();
+    var cost = perfNow() - t0;
+    clickCost = clickCost * 0.8 + cost * 0.2;         // smoothed cost per frame
   }
   function shimmerTick() {
     Game.shimmers.slice().forEach(function (s) {
@@ -434,6 +464,19 @@
   }
 
   /* ------------------------------------------------------------------ save backups */
+  /* ------------------------------------------------------------------ settings persistence */
+  function persistSettings() {
+    try { localStorage.setItem(LS_SETTINGS, JSON.stringify(S)); } catch (e) {}
+  }
+  function restoreSettings() {
+    try {
+      var str = localStorage.getItem(LS_SETTINGS);
+      if (!str) return;
+      var d = JSON.parse(str);
+      for (var k in d) if (k in S) S[k] = d[k];
+    } catch (e) {}
+  }
+
   function readIndex() {
     try { return JSON.parse(localStorage.getItem(LS_IDX) || '[]'); } catch (e) { return []; }
   }
@@ -563,6 +606,7 @@
         chipHist = [];
         stockPaid = {};                                              // the stock market starts over after an ascension
         seasonRun.idx = 0; seasonRun.since = 0; seasonRun.done = false;   // the season resets too, so run the cycle again
+        evalCache.t = 0; info.best = null;
         logEvent('Reincarnated');
         break;
     }
@@ -741,6 +785,9 @@
 
   /* ------------------------------------------------------------------ UI */
   var panel, tableEl, infoEl, canvas;
+  var uiEls = null;                 // cached control nodes (perf: no querySelectorAll while refreshing)
+  var lastInfoHtml = '', lastLogSig = '', lastGraphSig = '';
+  var nextChipCache = { t: 0, v: 0 };
   var SCHEMA = [
     ['h', 'Clicking'],
     ['click', 'bool', 'Auto-click cookie'],
@@ -822,7 +869,7 @@
     ['_logClear', 'btn', 'Clear log', 'logclear'],
     ['_log', 'log'],
     ['h', 'Safety and tools'],
-    ['hotkeys', 'bool', 'Hotkeys: P pause, S save, R reset settings'],
+    ['hotkeys', 'bool', 'Hotkeys: P pause, S save, R wipe save'],
     ['bgProtect', 'bool', 'Keep working in background tabs'],
     ['_setExp', 'btn', 'Copy bot settings', 'setexport'],
     ['_setImp', 'btn', 'Paste bot settings', 'setimport'],
@@ -906,7 +953,7 @@
     seasonSwitch: "Needs the Season switcher heavenly upgrade. Buys the season biscuits in turn so every season's cookies can drop. Never switches during a frenzy, because the price scales with your CpS.",
     seasonMinutes: "How long to stay in each season before moving to the next.",
     seasonHome: "The season to move to once the cycle is finished.",
-    hotkeys: "P pauses or resumes the bot, S saves the game, R resets the bot settings (after a warning). E always opens the export string. Ignored while you type in a box.",
+    hotkeys: "P pauses or resumes the bot, S saves the game, R wipes your save (after a warning; your bot settings stay). E always opens the export string. Ignored while you type in a box.",
     bgProtect: "Runs the bot's timers in a Web Worker so clicking and golden cookies keep working at full speed while the tab is hidden.",
     format: "How big numbers are written.",
     graph: "What the little graph at the top shows.",
@@ -991,6 +1038,20 @@
     });
   }
 
+  function wipeSave() {
+    dialog({
+      title: 'Wipe your save?',
+      msg: 'WARNING: this deletes ALL game progress — cookies, buildings, upgrades, achievements, prestige and heavenly chips. Your bot settings are left alone. Export a save first if you might want it back.',
+      ok: 'Wipe save', cancel: 'Cancel',
+      onOk: function () {
+        if (typeof Game.HardReset !== 'function') { toast(NAME, 'Wipe not available'); return; }
+        Game.HardReset(true);                       // true: skip the game's own prompt, we just asked
+        logEvent('Save wiped (hotkey)');
+        toast(NAME, 'Save wiped');
+      }
+    });
+  }
+
   function applyPreset(name) {
     if (name === 'reset') {
       dialog({
@@ -1013,29 +1074,27 @@
     refreshControls(); applySettings();
   }
   function syncQuick() {
-    if (!panel) return;
-    panel.querySelectorAll('[data-q]').forEach(function (el) { el.classList.toggle('on', !!S[el.dataset.q]); });
-    panel.querySelectorAll('[data-sub]').forEach(function (el) { el.classList.toggle('off', !S[el.dataset.sub]); });
-    var ms = panel.querySelector('#abMasterState');
-    if (ms) ms.textContent = S.enabled ? 'ON' : 'OFF';
-    var dot = panel.querySelector('#abDot');
-    if (dot) { dot.classList.toggle('on', botActive()); dot.title = botActive() ? 'Bot is running' : 'Bot is paused'; }
+    if (!panel || !uiEls) return;
+    uiEls.q.forEach(function (el) { el.classList.toggle('on', !!S[el.dataset.q]); });
+    uiEls.sub.forEach(function (el) { el.classList.toggle('off', !S[el.dataset.sub]); });
+    if (uiEls.ms) uiEls.ms.textContent = S.enabled ? 'ON' : 'OFF';
+    if (uiEls.dot) uiEls.dot.classList.toggle('on', botActive());
+    if (uiEls.master) uiEls.master.classList.toggle('on', !!S.enabled);
   }
 
   var CSS = [
     '#autoBakerPanel{--ac:#4aa3ff;--acrgb:74,163,255;--acl:#7cc4ff;--acp:#bfe0ff;--rd:#ff5a5a;--rdrgb:255,90,90;--rdp:#ffc4c4;position:fixed;z-index:100000;width:272px;background:linear-gradient(160deg,rgba(40,47,58,.97),rgba(24,28,35,.97));',
     'color:#d5dbe4;font:600 12.5px/1.35 Rajdhani,"Segoe UI",system-ui,sans-serif;letter-spacing:.2px;',
-    'border:1px solid var(--ac);border-radius:10px;box-shadow:0 0 0 1px rgba(var(--acrgb),.15),0 0 22px rgba(var(--acrgb),.28),0 6px 24px rgba(0,0,0,.6)}',
+    'border:1px solid var(--ac);border-radius:10px;box-shadow:0 0 0 1px rgba(var(--acrgb),.15),0 0 14px rgba(var(--acrgb),.2),0 6px 18px rgba(0,0,0,.55)}',
     '#autoBakerPanel .abHead{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;cursor:move;touch-action:none;',
     'user-select:none;background:linear-gradient(180deg,#3d4756,#272e39);border-bottom:1px solid var(--ac);border-radius:9px 9px 0 0}',
     '#autoBakerPanel .abTitle{font:800 9px Orbitron,"Segoe UI",sans-serif;letter-spacing:.3px;white-space:nowrap;text-transform:uppercase;',
-    'background:linear-gradient(90deg,var(--acp),var(--ac) 60%,var(--acl));-webkit-background-clip:text;background-clip:text;color:transparent;',
-    'filter:drop-shadow(0 0 5px rgba(var(--acrgb),.55))}',
+    'background:linear-gradient(90deg,var(--acp),var(--ac) 60%,var(--acl));-webkit-background-clip:text;background-clip:text;color:transparent}',
     '#autoBakerPanel .abVer{margin-left:6px;font:700 9px Orbitron,sans-serif;color:#7d8ba0;letter-spacing:.5px}',
     '#autoBakerPanel .abBtn{cursor:pointer;color:var(--acp);background:#2b333f;border:1px solid var(--ac);border-radius:5px;width:24px;height:20px;',
     'font-weight:800;line-height:17px;text-align:center;margin-left:10px;transition:all .15s}',
-    '#autoBakerPanel .abBtn:hover{background:var(--ac);color:#0b1320;box-shadow:0 0 10px rgba(var(--acrgb),.8)}',
-    '#autoBakerPanel .abBody{padding:8px;max-height:70vh;overflow:auto}',
+    '#autoBakerPanel .abBtn:hover{background:var(--ac);color:#0b1320}',
+    '#autoBakerPanel .abBody{padding:8px;max-height:70vh;overflow:auto;overscroll-behavior:contain}',
     '#autoBakerPanel .abBody::-webkit-scrollbar{width:8px}',
     '#autoBakerPanel .abBody::-webkit-scrollbar-thumb{background:#4a5666;border-radius:4px}',
     '#autoBakerPanel .abBody::-webkit-scrollbar-thumb:hover{background:var(--ac)}',
@@ -1065,14 +1124,14 @@
     '#autoBakerPanel input[type=checkbox]{accent-color:var(--ac);margin-right:4px}',
     '#autoBakerPanel input,#autoBakerPanel select,#autoBakerPanel textarea{background:#161b22;color:#eaf3ff;border:1px solid #4a5666;border-radius:4px;',
     'font:600 12px Rajdhani,"Segoe UI",sans-serif;padding:1px 4px}',
-    '#autoBakerPanel input:focus,#autoBakerPanel select:focus{outline:none;border-color:var(--ac);box-shadow:0 0 6px rgba(var(--acrgb),.6)}',
+    '#autoBakerPanel input:focus,#autoBakerPanel select:focus{outline:none;border-color:var(--ac)}',
     '#autoBakerPanel table{border-collapse:collapse;width:100%;font-size:12px;font-variant-numeric:tabular-nums}',
     '#autoBakerPanel th{color:#7d8ba0;font:700 9.5px Orbitron,sans-serif;letter-spacing:1px;text-transform:uppercase}',
     '#autoBakerPanel td,#autoBakerPanel th{padding:1px 3px}',
     '#autoBakerPanel tr:nth-child(even) td{background:rgba(255,255,255,.03)}',
     '#autoBakerPanel select{max-width:158px}',
     '#autoBakerPanel .abDot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#7d8ba0;margin-right:7px}',
-    '#autoBakerPanel .abDot.on{background:#4ad07a;box-shadow:0 0 6px #4ad07a}',
+    '#autoBakerPanel .abDot.on{background:#4ad07a}',
     '#autoBakerPanel .abQuick{margin-bottom:6px;padding:6px 8px;border:1px solid #38424f;border-radius:6px;background:rgba(10,14,20,.35)}',
     '#autoBakerPanel .abMaster{display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none;padding:3px 8px;margin-bottom:5px;',
     'border-radius:5px;border:1px solid var(--ac);background:rgba(var(--acrgb),.12);font:800 11px Orbitron,sans-serif;letter-spacing:1.2px;text-transform:uppercase;color:var(--acp)}',
@@ -1087,7 +1146,7 @@
     '#autoBakerPanel .abOk:hover{background:var(--ac);color:#0b1320}',
     /* inline warnings: small red boxes in the same style as the rest of the panel */
     '#autoBakerPanel .abWarn{margin:1px 0 4px 16px;padding:3px 7px;font-size:11px;color:var(--rdp);background:rgba(var(--rdrgb),.12);',
-    'border:1px solid var(--rd);border-left:3px solid var(--rd);border-radius:5px;box-shadow:0 0 8px rgba(var(--rdrgb),.18)}',
+    'border:1px solid var(--rd);border-left:3px solid var(--rd);border-radius:5px}',
     '#autoBakerPanel .abSub{margin-left:16px}',
     '#autoBakerPanel .abSub.off{opacity:.45}',
     '#autoBakerPanel .abLog{margin-top:4px;max-height:130px;overflow:auto;padding:4px 6px;background:rgba(10,14,20,.6);border:1px solid #38424f;border-radius:5px;font-size:11px;color:#c3cfdd;word-break:break-word}',
@@ -1096,18 +1155,18 @@
     /* warning dialog: replaces the browser confirm / prompt boxes */
     '#autoBakerPanel .abDlgBack{position:fixed;left:0;top:0;right:0;bottom:0;z-index:100001;display:flex;align-items:center;justify-content:center;padding:12px;background:rgba(0,0,0,.55)}',
     '#autoBakerPanel .abDlg{width:300px;max-width:100%;color:#f3d6d6;background:linear-gradient(160deg,rgba(62,30,34,.98),rgba(32,17,20,.98));',
-    'border:1px solid var(--rd);border-radius:10px;box-shadow:0 0 0 1px rgba(var(--rdrgb),.18),0 0 22px rgba(var(--rdrgb),.35),0 6px 24px rgba(0,0,0,.65)}',
+    'border:1px solid var(--rd);border-radius:10px;box-shadow:0 0 0 1px rgba(var(--rdrgb),.18),0 0 18px rgba(var(--rdrgb),.28),0 6px 20px rgba(0,0,0,.6)}',
     '#autoBakerPanel .abDlgHead{padding:8px 10px;font:800 10.5px Orbitron,"Segoe UI",sans-serif;letter-spacing:1.4px;text-transform:uppercase;color:var(--rdp);',
-    'background:linear-gradient(180deg,#5c2a2f,#3a1c20);border-bottom:1px solid var(--rd);border-radius:9px 9px 0 0;filter:drop-shadow(0 0 5px rgba(var(--rdrgb),.45))}',
+    'background:linear-gradient(180deg,#5c2a2f,#3a1c20);border-bottom:1px solid var(--rd);border-radius:9px 9px 0 0}',
     '#autoBakerPanel .abDlgMsg{padding:10px 10px 8px;font-size:12.5px;white-space:pre-wrap;word-break:break-word}',
     '#autoBakerPanel .abDlgIn{padding:0 10px 8px}',
     '#autoBakerPanel .abDlgText{display:block;width:100%;box-sizing:border-box;resize:vertical;color:#ffe9e9;background:#1a0f11;border:1px solid #7a3a40}',
-    '#autoBakerPanel .abDlgText:focus{outline:none;border-color:var(--rd);box-shadow:0 0 6px rgba(var(--rdrgb),.6)}',
+    '#autoBakerPanel .abDlgText:focus{outline:none;border-color:var(--rd)}',
     '#autoBakerPanel .abDlgBtns{display:flex;gap:6px;justify-content:flex-end;padding:0 10px 10px}',
     '#autoBakerPanel .abDlgBtn{cursor:pointer;color:var(--rdp);background:rgba(var(--rdrgb),.12);border:1px solid var(--rd);border-radius:5px;padding:2px 12px;font:700 11.5px Rajdhani,sans-serif}',
     '#autoBakerPanel .abDlgBtn:hover{background:rgba(var(--rdrgb),.3);color:#fff}',
     '#autoBakerPanel .abDlgGo{background:var(--rd);color:#2a0b0d}',
-    '#autoBakerPanel .abDlgGo:hover{background:#ff7a7a;color:#1a0507;box-shadow:0 0 10px rgba(var(--rdrgb),.8)}',
+    '#autoBakerPanel .abDlgGo:hover{background:#ff7a7a;color:#1a0507}',
   ].join('');
 
   function clampPanel() {
@@ -1219,7 +1278,7 @@
     }
     else if (act === 'setexport') exportSettings();
     else if (act === 'setimport') importSettings();
-    else if (act === 'logclear') { logList = []; note('Log cleared'); refreshInfo(); }
+    else if (act === 'logclear') { logList = []; lastLogSig = ''; note('Log cleared'); refreshInfo(); }
   }
 
   function buildUI() {
@@ -1287,8 +1346,19 @@
     document.body.appendChild(panel);
     infoEl = panel.querySelector('#abInfo'); tableEl = panel.querySelector('#abTable'); canvas = panel.querySelector('#abGraph');
 
+    // cache the control nodes once so the 1 Hz refresh never walks the DOM again
+    uiEls = {
+      q: panel.querySelectorAll('[data-q]'),
+      sub: panel.querySelectorAll('[data-sub]'),
+      k: panel.querySelectorAll('[data-k]'),
+      secs: panel.querySelectorAll('details[data-sec]'),
+      ms: panel.querySelector('#abMasterState'),
+      dot: panel.querySelector('#abDot'),
+      master: panel.querySelector('#abMaster')
+    };
+
     var types = {}; SCHEMA.forEach(function (r) { if (r[0] !== 'h') types[r[0]] = r; });
-    panel.querySelectorAll('[data-k]').forEach(function (el) {
+    uiEls.k.forEach(function (el) {
       el.addEventListener('change', function () {
         var k = el.dataset.k, r = types[k], v;
         if (r[1] === 'bool') v = el.checked;
@@ -1311,7 +1381,7 @@
         S[k] = v; applySettings(); syncQuick();
       });
     });
-    panel.querySelectorAll('details[data-sec]').forEach(function (d) {
+    uiEls.secs.forEach(function (d) {
       d.addEventListener('toggle', function () {
         if (!S.openSecs) S.openSecs = {};
         S.openSecs[d.dataset.sec] = !!d.open;
@@ -1339,10 +1409,10 @@
   }
   function refreshControls() {
     if (!panel) return;
-    panel.querySelectorAll('details[data-sec]').forEach(function (d) {
+    if (uiEls) uiEls.secs.forEach(function (d) {
       d.open = !!(S.openSecs && S.openSecs[d.dataset.sec]);
     });
-    panel.querySelectorAll('[data-k]').forEach(function (el) {
+    if (uiEls) uiEls.k.forEach(function (el) {
       var v = S[el.dataset.k];
       if (el.type === 'checkbox') el.checked = !!v; else el.value = v;
     });
@@ -1350,6 +1420,7 @@
     var tipEl = panel.querySelector('#abTip');
     if (tipEl) tipEl.style.display = S.tipSeen ? 'none' : '';
     syncQuick();
+    lastInfoHtml = '';                       // force the next info refresh to paint
   }
   function applySettings() {
     if (S.fps >= 10 && Game.fps !== S.fps) Game.fps = S.fps;
@@ -1364,11 +1435,14 @@
     for (var d = el.closest('details'); d; d = d.parentElement && d.parentElement.closest('details')) {
       if (!d.open) return;                              // only redraw while its section and category are open
     }
-    var keepScroll = el.scrollTop;                      // redrawing twice a second must not throw the scroll position away
+    var sig = logList.length + ':' + (logList.length ? logList[logList.length - 1].t : 0);
+    if (sig === lastLogSig) return;                     // nothing new: keep the existing DOM
+    lastLogSig = sig;
+    var keepScroll = el.scrollTop;                      // redrawing must not throw the scroll position away
     var last = logList.slice(-40).reverse();
     el.innerHTML = last.length ? last.map(function (e) {
-      var d = new Date(e.t);
-      return '<div><span class="abT">' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) + '</span>' + esc(e.m) + '</div>';
+      var d2 = new Date(e.t);
+      return '<div><span class="abT">' + pad(d2.getHours()) + ':' + pad(d2.getMinutes()) + ':' + pad(d2.getSeconds()) + '</span>' + esc(e.m) + '</div>';
     }).join('') : '<div>Nothing logged yet.</div>';
     el.scrollTop = keepScroll;
   }
@@ -1389,7 +1463,12 @@
     if (buffs.length) h += line('Buffs', buffs.join(', '));
     try {
       var pend = pendingChips(), cps = Math.max(Game.cookiesPs, 0.01);
-      var nextAt = Game.HowManyCookiesReset(Game.prestige + Math.max(pend, 0) + 1) - (Game.cookiesReset + Game.cookiesEarned);
+      // "cookies until the next chip" is a search, so it is cached for a few seconds (perf)
+      if (now() - nextChipCache.t > 5000) {
+        nextChipCache.t = now();
+        nextChipCache.v = Game.HowManyCookiesReset(Game.prestige + Math.max(pend, 0) + 1) - (Game.cookiesReset + Game.cookiesEarned);
+      }
+      var nextAt = nextChipCache.v;
       var rate = '';
       if (hist.length > 2) {
         var f = hist[0], l = hist[hist.length - 1], dt = (l.t - f.t) / 3600000;
@@ -1419,7 +1498,7 @@
     } catch (e) {}
     if (S.backup !== 'off') h += line('Backup', 'last ' + fmtTime((now() - bk.last) / 1000) + ' ago · next in ' + fmtTime(Math.max(0, S.backupMin * 60 - (now() - bk.last) / 1000)));
     if (S.logOn) h += line('Session', sess.bought + ' bought · ' + sess.popped + ' popped · ' + sess.golden + ' cookies clicked' + (sess.lumps ? ' · ' + sess.lumps + ' lumps' : '') + (sess.casts ? ' · ' + sess.casts + ' casts' : ''));
-    infoEl.innerHTML = h;
+    if (h !== lastInfoHtml) { infoEl.innerHTML = h; lastInfoHtml = h; }   // repaint only when the text changed
     refreshLog();
 
     if (S.showTable) {
@@ -1430,28 +1509,30 @@
           return '<tr' + (c.blocked ? ' style="opacity:.4"' : '') + '><td>' + esc(c.name) + '</td><td>' + Math.round(best / c.score * 100) +
             '</td><td>' + fmt(c.price) + '</td><td>' + fmt(c.gain) + '</td></tr>';
         }).join('') + '</table>';
-    } else tableEl.innerHTML = '';
+    } else if (tableEl.innerHTML) tableEl.innerHTML = '';
     drawGraph();
   }
   function drawGraph() {
     if (!canvas || !canvas.getContext || hist.length < 2) return;
+    var key = S.graph, p = hist[hist.length - 1];
+    var sig = hist.length + '|' + key + '|' + p[key];
+    if (sig === lastGraphSig) return;                  // only redraw when a new sample arrives
+    lastGraphSig = sig;
     var ctx = canvas.getContext('2d');
     if (!ctx) return;
-    var w = canvas.width, h = canvas.height, key = S.graph;
+    var w = canvas.width, h = canvas.height;
     ctx.clearRect(0, 0, w, h);
-    var vals = hist.map(function (p) { return Math.log10(Math.max(p[key], 1)); });
+    var vals = hist.map(function (q) { return Math.log10(Math.max(q[key], 1)); });
     var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
     if (hi - lo < 0.01) hi = lo + 0.01;
-    var accent = '#4aa3ff';
-    ctx.strokeStyle = accent; ctx.lineWidth = 1.8; ctx.shadowColor = accent; ctx.shadowBlur = 6; ctx.beginPath();
+    ctx.strokeStyle = '#4aa3ff'; ctx.lineWidth = 1.8; ctx.beginPath();
     vals.forEach(function (v, i) {
       var x = i / (vals.length - 1) * w, y = h - 4 - (v - lo) / (hi - lo) * (h - 8);
       if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
     });
     ctx.stroke();
-    ctx.shadowBlur = 0;
     ctx.fillStyle = '#9fb3c8'; ctx.font = '600 10px Rajdhani, sans-serif';
-    ctx.fillText(key + ' (log) ' + fmt(hist[hist.length - 1][key]), 4, 10);
+    ctx.fillText(key + ' (log) ' + fmt(p[key]), 4, 10);
   }
 
   /* ------------------------------------------------------------------ heartbeat */
@@ -1507,12 +1588,13 @@
     } else if (k === 's') {
       try { Game.WriteSave(); logEvent('Game saved (hotkey)'); toast(NAME, 'Game saved'); } catch (x) { toast(NAME, 'Save failed'); }
     } else if (k === 'r') {
-      applyPreset('reset');           // asks for confirmation first
+      wipeSave();                     // asks for confirmation first
     }
   }
 
   Game.registerMod(MOD_ID, {
     init: function () {
+      restoreSettings();                                  // settings last mirrored when the game saved
       buildUI();
       applySettings();
       for (var k in Game.buffs) seenBuffs[k] = true;       // buffs already running when the bot loads don't trigger alerts
@@ -1520,16 +1602,16 @@
       startHeartbeat();
       sample(); setTimeout(sample, 1500);
       timers.push(setInterval(sample, 5000));
-      timers.push(setInterval(refreshInfo, 500));
+      timers.push(setInterval(refreshInfo, 1000));          // 1 Hz: the panel is the second biggest CPU user
       document.addEventListener('keydown', onKey);
       logEvent('Bot ' + LABEL + ' started');
       Game.Notify(NAME + ' ' + LABEL + ' is ready', 'The bot is on. Open a section to change settings, or pick a preset. Hover anything for help. Drag the title bar to move the panel.', [16, 5], 6);
     },
-    save: function () { return JSON.stringify(S); },
+    save: function () { persistSettings(); return JSON.stringify(S); },   // the game calls this on every save
     load: function (str) {
       S = JSON.parse(JSON.stringify(DEFAULTS));      // a loaded save brings its own settings; nothing carries over from the previous one
       try { var d = JSON.parse(str); for (var k in d) if (k in S) S[k] = d[k]; } catch (e) {}
-      refreshControls(); applySettings();
+      refreshControls(); applySettings(); persistSettings();
     }
   });
 })();
